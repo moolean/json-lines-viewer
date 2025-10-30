@@ -1,14 +1,22 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
-import {createReadStream} from 'fs';
+import {createReadStream, open, stat} from 'fs';
 import {createInterface} from 'readline';
 import { url } from 'inspector';
+import { promisify } from 'util';
 
 
 const jsonlScheme = 'jsonl';
 let lineIndexDict = Object();	// Store current line index of previewed json files
 let lineIdxStatusBarItem: vscode.StatusBarItem;
+
+// Cache for storing line positions (byte offsets) in files
+// Structure: { filePath: { lineNumber: byteOffset, totalLines: count } }
+let linePositionCache: { [filePath: string]: { positions: { [lineNum: number]: number }, totalLines: number, lastModified: number } } = {};
+
+const openAsync = promisify(open);
+const statAsync = promisify(stat);
 
 
 // A custom content provider for jsonl file
@@ -53,7 +61,56 @@ export function activate(context: vscode.ExtensionContext) {
 	updateLineIdxStatusBarItem();
 }
 
-// Read a file content at specified line index
+// Build line position cache for a file
+// This creates an index of byte positions for efficient seeking
+// For very large files, we sample positions to reduce memory usage
+async function buildLinePositionCache(filePath: string): Promise<void> {
+	const stats = await statAsync(filePath);
+	const fileSize = stats.size;
+	const lastModified = stats.mtimeMs;
+	
+	// Check if cache exists and is still valid
+	const cachedData = linePositionCache[filePath];
+	if (cachedData && cachedData.lastModified === lastModified) {
+		return; // Cache is valid
+	}
+	
+	// Initialize cache for this file
+	const positions: { [lineNum: number]: number } = {};
+	let lineNum = 0;
+	let byteOffset = 0;
+	
+	const fileStream = createReadStream(filePath);
+	const rl = createInterface({
+		input: fileStream,
+		crlfDelay: Infinity
+	});
+	
+	// For large files (>10MB), sample every 100th line to reduce memory usage
+	// For smaller files, cache every line position
+	const sampleRate = fileSize > 10 * 1024 * 1024 ? 100 : 1;
+	
+	for await (const line of rl) {
+		lineNum++;
+		
+		// Store position for this line if it's a sample point or first line
+		if (lineNum === 1 || lineNum % sampleRate === 0) {
+			positions[lineNum] = byteOffset;
+		}
+		
+		// Update byte offset (line length + newline character(s))
+		byteOffset += Buffer.byteLength(line, 'utf8') + 1; // +1 for \n
+	}
+	
+	// Store the cache
+	linePositionCache[filePath] = {
+		positions: positions,
+		totalLines: lineNum,
+		lastModified: lastModified
+	};
+}
+
+// Read a file content at specified line index using cached positions
 // If line index <=0, return first line
 // If line index exceed file's line count, return last line
 // Input: 	- file's uri
@@ -65,21 +122,75 @@ async function readFileAtLine(uri: vscode.Uri, lineIdx: number): Promise<[string
 		lineIdx = 1;
 	}
 
-	const fileStream = createReadStream(uri.path.replace('(preview)','').trimEnd());
+	const filePath = uri.path.replace('(preview)','').trimEnd();
+	
+	// Build or update cache if needed
+	await buildLinePositionCache(filePath);
+	
+	const cachedData = linePositionCache[filePath];
+	if (!cachedData) {
+		// Fallback to old method if cache building failed
+		return readFileAtLineOld(filePath, lineIdx);
+	}
+	
+	// Adjust lineIdx if it exceeds total lines
+	if (lineIdx > cachedData.totalLines) {
+		lineIdx = cachedData.totalLines;
+	}
+	
+	// Find the closest cached position before or at the target line
+	let startPosition = 0;
+	let startLine = 1;
+	
+	const cachedPositions = cachedData.positions;
+	for (const [cachedLineStr, position] of Object.entries(cachedPositions)) {
+		const cachedLine = parseInt(cachedLineStr);
+		if (cachedLine <= lineIdx && cachedLine >= startLine) {
+			startLine = cachedLine;
+			startPosition = position;
+		}
+	}
+	
+	// If we have an exact match in cache, start from there
+	// Otherwise, start from the closest position and read forward
+	const fileStream = createReadStream(filePath, { start: startPosition });
+	const rl = createInterface({
+		input: fileStream,
+		crlfDelay: Infinity
+	});
+	
+	let currentLine = startLine;
+	let line = '';
+	
+	for await (line of rl) {
+		if (currentLine === lineIdx) {
+			rl.close();
+			fileStream.destroy();
+			return [line, currentLine];
+		}
+		currentLine++;
+	}
+	
+	// Return last line if we've read to the end
+	return [line, currentLine - 1];
+}
+
+// Fallback method: old implementation for reading file line by line
+async function readFileAtLineOld(filePath: string, lineIdx: number): Promise<[string,number]> {
+	const fileStream = createReadStream(filePath);
   
 	const rl = createInterface({
 	  input: fileStream,
 	  crlfDelay: Infinity
 	});
-	// Note: we use the crlfDelay option to recognize all instances of CR LF
-	// ('\r\n') in input.txt as a single line break.
   
-	// TODO: not having to iterate from the begining of file every time
 	let idx = 0;
 	let line='';
 	for await (line of rl) {
 		idx+=1;
 		if (idx === lineIdx) {
+			rl.close();
+			fileStream.destroy();
 			return [line, idx];
 		}
   	}

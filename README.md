@@ -12,6 +12,13 @@ To open the preview, do one of the following:
 Move to different lines:
 - Click the `JSONL Next Line`, `JSONL Previous Line` or `JSONL Go to Line` icon in the editor title bar, or run the corresponding command.
 
+### Large File Support
+This extension efficiently handles very large JSONL files with minimal memory overhead:
+- **Intelligent caching**: Creates a byte-position index for fast line access without loading the entire file
+- **Memory efficient**: For files > 10MB, only samples every 100th line position, using ~1% of memory compared to full indexing
+- **Fast navigation**: Jump to any line instantly without reading from the beginning of the file
+- **No file size limits**: Works with JSONL files of any size
+
 ![JSON Lines Viewer](./resources/json-lines-viewer.png "Text to show on mouseover")
 <!-- ## Requirements -->
 
@@ -31,6 +38,13 @@ Move to different lines:
 
 ## Release Notes
 
+
+### 0.0.5
+Add support for large files with minimal memory overhead
+- Implement intelligent line position caching
+- Support files of any size without loading entire file into memory
+- Use sampling strategy for files > 10MB to reduce memory usage
+- Enable instant navigation to any line
 
 ### 0.0.1
 Initial release
