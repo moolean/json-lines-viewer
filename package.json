@@ -1,12 +1,12 @@
 {
   "name": "json-lines-viewer",
-  "displayName": "JSON Lines Viewer",
+  "displayName": "JSON Lines Viewer (moolean fork)",
   "description": "View each line of JSON Lines file in json format",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "publisher": "lehoanganh298",
   "repository": {
     "type": "git",
-    "url": "https://github.com/lehoanganh298/json-lines-viewer.git"
+    "url": "https://github.com/moolean/json-lines-viewer.git"
   },
   "engines": {
     "vscode": "^1.64.0"
@@ -22,7 +22,11 @@
     "jsonl preview"
   ],
   "activationEvents": [
-    "onCommand:json-lines-viewer.preview"
+    "onCommand:json-lines-viewer.preview",
+    "onCommand:json-lines-viewer.next-line",
+    "onCommand:json-lines-viewer.previous-line",
+    "onCommand:json-lines-viewer.go-to-line",
+    "onCommand:json-lines-viewer.refresh"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -49,6 +53,12 @@
         "title": "JSONL Go to Line",
         "icon": "$(selection)",
         "enablement": "resourceScheme == jsonl"
+      },
+      {
+        "command": "json-lines-viewer.refresh",
+        "title": "JSONL Refresh Preview",
+        "icon": "$(refresh)",
+        "enablement": "resourceScheme == jsonl"
       }
     ],
     "languages": [
@@ -56,7 +66,8 @@
         "id": "jsonl",
         "extensions": [
           ".jsonl",
-          ".jl"
+          ".jl",
+          ".ndjson"
         ],
         "aliases": [
           "JSON Lines",
@@ -67,14 +78,14 @@
     "menus": {
       "explorer/context": [
         {
-          "when": "resourceLangId == jsonl",
+          "when": "resourceLangId == jsonl || resourceExtname =~ /\\.(jsonl|jl|ndjson)$/i",
           "command": "json-lines-viewer.preview",
           "group": "navigation"
         }
       ],
       "editor/title": [
         {
-          "when": "editorLangId == jsonl",
+          "when": "editorLangId == jsonl || resourceExtname =~ /\\.(jsonl|jl|ndjson)$/i || resourceScheme == jsonl",
           "command": "json-lines-viewer.preview",
           "group": "navigation"
         },
@@ -92,6 +103,11 @@
           "when": "resourceScheme == jsonl",
           "command": "json-lines-viewer.go-to-line",
           "group": "navigation@2"
+        },
+        {
+          "when": "resourceScheme == jsonl",
+          "command": "json-lines-viewer.refresh",
+          "group": "navigation@4"
         }
       ]
     }
@@ -102,7 +118,8 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js"
+    "test": "node ./out/test/runTest.js",
+    "test:unit": "npm run compile && mocha --ui tdd out/test/unit/*.test.js"
   },
   "devDependencies": {
     "@types/glob": "^7.2.0",
@@ -116,8 +133,5 @@
     "glob": "^7.2.0",
     "mocha": "^9.1.3",
     "typescript": "^4.5.4"
-  },
-  "dependencies": {
-    "vscode-uri": "^3.0.3"
   }
 }
