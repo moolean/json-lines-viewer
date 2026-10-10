@@ -1,299 +1,227 @@
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
-import {createReadStream, open, stat} from 'fs';
-import {createInterface} from 'readline';
-import { url } from 'inspector';
-import { promisify } from 'util';
+import { FileLineReader, formatLine, LineResult, parseLineNumber } from './lineReader';
 
+const previewScheme = 'jsonl';
+const supportedPath = /\.(jsonl|jl|ndjson)$/i;
 
-const jsonlScheme = 'jsonl';
-let lineIndexDict = Object();	// Store current line index of previewed json files
-let lineIdxStatusBarItem: vscode.StatusBarItem;
-
-// Cache for storing line positions (byte offsets) in files
-// Structure: { filePath: { lineNumber: byteOffset, totalLines: count } }
-let linePositionCache: { [filePath: string]: { positions: { [lineNum: number]: number }, totalLines: number, lastModified: number } } = {};
-
-const openAsync = promisify(open);
-const statAsync = promisify(stat);
-
-
-// A custom content provider for jsonl file
-class JsonlContentProvider implements vscode.TextDocumentContentProvider {
-
-	onDidChangeEmitter = new vscode.EventEmitter<vscode.Uri>();
-	onDidChange = this.onDidChangeEmitter.event;
-
-	async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
-		let lineIdx = lineIndexDict[uri.path];
-		if (lineIdx === undefined) {
-			lineIdx=1;
-			lineIndexDict[uri.path]=lineIdx;
-		}
-		const res = await readFileAtLine(uri,lineIdx);
-		lineIndexDict[uri.path] = res[1]; // handle when line index invalid
-		updateLineIdxStatusBarItem();
-		
-		const lineFormated = JSON.stringify(JSON.parse(res[0]), null, 2);
-		return lineFormated;
-	}
-};
-
-
-const jsonlProvider = new JsonlContentProvider();
-
-
-// this method is called when your extension is activated
-// your extension is activated the very first time the command is executed
-export function activate(context: vscode.ExtensionContext) {
-
-	context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider(jsonlScheme, jsonlProvider));
-
-	context.subscriptions.push(vscode.commands.registerCommand('json-lines-viewer.preview', openPreviewHandler));
-	context.subscriptions.push(vscode.commands.registerCommand('json-lines-viewer.next-line', nextLineHandler));
-	context.subscriptions.push(vscode.commands.registerCommand('json-lines-viewer.previous-line', previousLineHandler));
-	context.subscriptions.push(vscode.commands.registerCommand('json-lines-viewer.go-to-line',goToLine));
-
-	lineIdxStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100000);
-	context.subscriptions.push(lineIdxStatusBarItem);
-	context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(updateLineIdxStatusBarItem));
-	updateLineIdxStatusBarItem();
+interface Preview {
+	source: vscode.Uri;
+	uri: vscode.Uri;
+	line: number;
+	totalLines?: number;
+	revision: number;
 }
 
-// Build line position cache for a file
-// This creates an index of byte positions for efficient seeking
-// For very large files, we sample positions to reduce memory usage
-async function buildLinePositionCache(filePath: string): Promise<void> {
-	const stats = await statAsync(filePath);
-	const fileSize = stats.size;
-	const lastModified = stats.mtimeMs;
-	
-	// Check if cache exists and is still valid
-	const cachedData = linePositionCache[filePath];
-	if (cachedData && cachedData.lastModified === lastModified) {
-		return; // Cache is valid
-	}
-	
-	// Initialize cache for this file
-	const positions: { [lineNum: number]: number } = {};
-	let lineNum = 0;
-	let byteOffset = 0;
-	
-	const fileStream = createReadStream(filePath);
-	const rl = createInterface({
-		input: fileStream,
-		crlfDelay: Infinity
-	});
-	
-	// For large files (>10MB), sample every 100th line to reduce memory usage
-	// For smaller files, cache every line position
-	const sampleRate = fileSize > 10 * 1024 * 1024 ? 100 : 1;
-	
-	for await (const line of rl) {
-		lineNum++;
-		
-		// Store position for this line if it's a sample point or first line
-		if (lineNum === 1 || lineNum % sampleRate === 0) {
-			positions[lineNum] = byteOffset;
-		}
-		
-		// Update byte offset (line length + newline character(s))
-		byteOffset += Buffer.byteLength(line, 'utf8') + 1; // +1 for \n
-	}
-	
-	// Store the cache
-	linePositionCache[filePath] = {
-		positions: positions,
-		totalLines: lineNum,
-		lastModified: lastModified
-	};
-}
+export function activate(context: vscode.ExtensionContext): void {
+	const previews = new Map<string, Preview>();
+	const reader = new FileLineReader();
+	const changes = new vscode.EventEmitter<vscode.Uri>();
+	const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100000);
+	status.command = 'json-lines-viewer.go-to-line';
+	context.subscriptions.push(status, changes);
 
-// Read a file content at specified line index using cached positions
-// If line index <=0, return first line
-// If line index exceed file's line count, return last line
-// Input: 	- file's uri
-// 			- line index
-// Output: 	- line's content
-// 			- returned line index
-async function readFileAtLine(uri: vscode.Uri, lineIdx: number): Promise<[string,number]> {
-	if (lineIdx<=0) {
-		lineIdx = 1;
+	function currentPreview(): Preview | undefined {
+		const editor = vscode.window.activeTextEditor;
+		return editor ? previews.get(editor.document.uri.toString()) : undefined;
 	}
 
-	const filePath = uri.path.replace('(preview)','').trimEnd();
-	
-	// Build or update cache if needed
-	await buildLinePositionCache(filePath);
-	
-	const cachedData = linePositionCache[filePath];
-	if (!cachedData) {
-		// Fallback to old method if cache building failed
-		return readFileAtLineOld(filePath, lineIdx);
-	}
-	
-	// Adjust lineIdx if it exceeds total lines
-	if (lineIdx > cachedData.totalLines) {
-		lineIdx = cachedData.totalLines;
-	}
-	
-	// Find the closest cached position before or at the target line
-	let startPosition = 0;
-	let startLine = 1;
-	
-	const cachedPositions = cachedData.positions;
-	for (const [cachedLineStr, position] of Object.entries(cachedPositions)) {
-		const cachedLine = parseInt(cachedLineStr);
-		if (cachedLine <= lineIdx && cachedLine >= startLine) {
-			startLine = cachedLine;
-			startPosition = position;
-		}
-	}
-	
-	// If we have an exact match in cache, start from there
-	// Otherwise, start from the closest position and read forward
-	const fileStream = createReadStream(filePath, { start: startPosition });
-	const rl = createInterface({
-		input: fileStream,
-		crlfDelay: Infinity
-	});
-	
-	let currentLine = startLine;
-	let line = '';
-	
-	for await (line of rl) {
-		if (currentLine === lineIdx) {
-			rl.close();
-			fileStream.destroy();
-			return [line, currentLine];
-		}
-		currentLine++;
-	}
-	
-	// Return last line if we've read to the end
-	return [line, currentLine - 1];
-}
-
-// Fallback method: old implementation for reading file line by line
-async function readFileAtLineOld(filePath: string, lineIdx: number): Promise<[string,number]> {
-	const fileStream = createReadStream(filePath);
-  
-	const rl = createInterface({
-	  input: fileStream,
-	  crlfDelay: Infinity
-	});
-  
-	let idx = 0;
-	let line='';
-	for await (line of rl) {
-		idx+=1;
-		if (idx === lineIdx) {
-			rl.close();
-			fileStream.destroy();
-			return [line, idx];
-		}
-  	}
-	return [line, idx];
-}
-
-
-const openPreviewHandler = async (arg: any) => {
-	let uri = arg;
-	if (!(uri instanceof vscode.Uri)) {
-		const activeEditor = vscode.window.activeTextEditor;
-		if (activeEditor && activeEditor.document.languageId === 'jsonl') {
-			uri = activeEditor.document.uri;
-		} else {
-			vscode.window.showInformationMessage("Open a JSON Lines file (.jsonl) first to show a preview.");
+	function updateStatus(): void {
+		const preview = currentPreview();
+		if (!preview) {
+			status.hide();
 			return;
 		}
-	}
-	
-	// Change uri-scheme to "jsonl"
-	let uriPath = "";
-	if (uri._fsPath !== undefined && uri._fsPath !== null) {
-		uriPath = uri._fsPath;
-	}
-	else {
-		uriPath = uri.path;
-	}
-	const jsonlUri = vscode.Uri.parse('jsonl:' + uriPath + ' (preview)');
-	
-	const document = await vscode.workspace.openTextDocument(jsonlUri);
-	await vscode.window.showTextDocument(document);
-	
-	await vscode.languages.setTextDocumentLanguage(document, "json");
-};
-
-
-const nextLineHandler = async () => {
-	if (!vscode.window.activeTextEditor) {
-		return; // no editor
-	}
-	const { document } = vscode.window.activeTextEditor;
-	if (document.uri.scheme !== jsonlScheme) {
-		return; // not my scheme
-	}
-	lineIndexDict[document.uri.path]+=1;
-	jsonlProvider.onDidChangeEmitter.fire(document.uri);
-};
-
-
-const previousLineHandler = async () => {
-	if (!vscode.window.activeTextEditor) {
-		return; // no editor
-	}
-	const { document } = vscode.window.activeTextEditor;
-	if (document.uri.scheme !== jsonlScheme) {
-		return; // not my scheme
-	}
-	lineIndexDict[document.uri.path]-=1;
-
-	jsonlProvider.onDidChangeEmitter.fire(document.uri);
-};
-
-
-const goToLine = async () => {
-	if (!vscode.window.activeTextEditor) {
-		return; // no editor
-	}
-	const { document } = vscode.window.activeTextEditor;
-	if (document.uri.scheme !== jsonlScheme) {
-		return; // not my scheme
+		const total = preview.totalLines === undefined ? '' : ` / ${preview.totalLines}`;
+		status.text = `JSONL at line: ${preview.line}${total}`;
+		status.tooltip = 'Click to jump to a physical line in the source file';
+		status.show();
 	}
 
-	let lineIdx = null;
-	while (lineIdx === null || isNaN(lineIdx)){
-		let lineIdxStr = await vscode.window.showInputBox(
-			{ prompt: 'Type a line number to preview Json object at that line.' });
-		if (lineIdxStr === undefined) {
-			break;
+	async function readSource(preview: Preview, line: number): Promise<LineResult> {
+		const openDocument = vscode.workspace.textDocuments.find(document =>
+			document.uri.toString() === preview.source.toString());
+		// Saved local files keep byte indexing, including files too large for the editor.
+		if (preview.source.scheme === 'file' && !openDocument?.isDirty) {
+			return reader.read(preview.source.fsPath, line);
 		}
+		// VS Code handles remote providers and unsaved changes with the original source URI.
+		const document = openDocument || await vscode.workspace.openTextDocument(preview.source);
+		let total = document.lineCount;
+		if (total === 1 && document.lineAt(0).text === '') {
+			return { text: '', line: 0, totalLines: 0 };
+		}
+		if (total > 1 && document.lineAt(total - 1).text === '') {
+			total--;
+		}
+		const selected = Math.max(1, Math.min(line, total));
+		return { text: document.lineAt(selected - 1).text, line: selected, totalLines: total };
+	}
 
-		lineIdx = parseInt(lineIdxStr);
-	}
-	if (lineIdx !== null){
-		lineIndexDict[document.uri.path] = lineIdx;
-		jsonlProvider.onDidChangeEmitter.fire(document.uri);
-	}
-};
+	context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider(previewScheme, {
+		onDidChange: changes.event,
+		async provideTextDocumentContent(uri): Promise<string> {
+			const preview = previews.get(uri.toString());
+			if (!preview) {
+				return '// Reopen this preview from its source JSON Lines file.';
+			}
+			// Rapid navigation must not be overwritten by an older asynchronous read.
+			while (true) {
+				const revision = preview.revision;
+				try {
+					const result = await readSource(preview, preview.line);
+					if (revision !== preview.revision) { continue; }
+					preview.line = result.line;
+					preview.totalLines = result.totalLines;
+					updateStatus();
+					return formatLine(result);
+				} catch (error) {
+					if (revision !== preview.revision) { continue; }
+					const message = error instanceof Error ? error.message : String(error);
+					return `// Cannot read the source file: ${message.replace(/[\r\n]+/g, ' ')}\n// Fix the file access and run JSONL Refresh Preview.`;
+				}
+			}
+		}
+	}));
 
+	function isSource(document: vscode.TextDocument): boolean {
+		return document.uri.scheme !== previewScheme &&
+			(supportedPath.test(document.uri.path) || document.languageId === 'jsonl');
+	}
 
-function updateLineIdxStatusBarItem(): void {
-	if (!vscode.window.activeTextEditor) {
-		lineIdxStatusBarItem.hide(); // no editor
-		return;
+	async function pickSource(): Promise<vscode.Uri | undefined> {
+		const documents = vscode.workspace.textDocuments.filter(isSource);
+		if (documents.length > 0) {
+			const items = documents.map(document => ({
+				label: document.uri.path.split('/').pop() || document.uri.toString(),
+				description: vscode.workspace.asRelativePath(document.uri),
+				uri: document.uri
+			}));
+			const browse = { label: 'Browse for a JSON Lines file...', description: '', uri: undefined };
+			const selected = await vscode.window.showQuickPick([...items, browse], {
+				placeHolder: 'Choose a JSON Lines file to preview'
+			});
+			if (!selected) { return undefined; }
+			if (selected.uri) { return selected.uri; }
+		}
+		const selected = await vscode.window.showOpenDialog({
+			canSelectMany: false,
+			canSelectFolders: false,
+			openLabel: 'Open JSON Lines Preview',
+			// Dialog filter names are user-facing labels.
+			// eslint-disable-next-line @typescript-eslint/naming-convention
+			filters: { 'JSON Lines': ['jsonl', 'jl', 'ndjson'], 'All files': ['*'] }
+		});
+		return selected?.[0];
 	}
-	const { document } = vscode.window.activeTextEditor;
-	if (document.uri.scheme !== jsonlScheme) {
-		lineIdxStatusBarItem.hide();
-		return; 
+
+	async function openPreview(arg?: vscode.Uri): Promise<void> {
+		try {
+			const active = vscode.window.activeTextEditor;
+			const existing = arg ? previews.get(arg.toString()) : currentPreview();
+			if (existing) {
+				await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(existing.uri));
+				return;
+			}
+			let source = arg;
+			if (!source && active && isSource(active.document)) { source = active.document.uri; }
+			if (!source) { source = await pickSource(); }
+			if (!source) { return; }
+			const key = source.toString();
+			let preview = Array.from(previews.values()).find(item => item.source.toString() === key);
+			const line = active?.document.uri.toString() === key ? active.selection.active.line + 1 : 1;
+			if (!preview) {
+				// Keep the complete URI, including remote authority and literal #, % and ?.
+				const uri = vscode.Uri.from({ scheme: previewScheme, path: `${source.path} (preview)`, query: key });
+				preview = { source, uri, line, revision: 0 };
+				previews.set(uri.toString(), preview);
+			} else {
+				preview.line = line;
+				preview.revision++;
+				changes.fire(preview.uri);
+			}
+			const document = await vscode.workspace.openTextDocument(preview.uri);
+			await vscode.languages.setTextDocumentLanguage(document, 'jsonc');
+			await vscode.window.showTextDocument(document, { preview: false });
+			updateStatus();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			void vscode.window.showErrorMessage(`Unable to open JSON Lines preview: ${message}`);
+		}
 	}
-	lineIdxStatusBarItem.text = `JSONL at line: ${lineIndexDict[document.uri.path]}`;
-	lineIdxStatusBarItem.show();
+
+	function navigate(line: number): void {
+		const preview = currentPreview();
+		if (!preview) { return; }
+		preview.line = Math.max(1, line);
+		preview.revision++;
+		changes.fire(preview.uri);
+		updateStatus();
+	}
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('json-lines-viewer.preview', openPreview),
+		vscode.commands.registerCommand('json-lines-viewer.next-line', () => {
+			const preview = currentPreview();
+			if (preview) { navigate(preview.line + 1); }
+		}),
+		vscode.commands.registerCommand('json-lines-viewer.previous-line', () => {
+			const preview = currentPreview();
+			if (preview) { navigate(preview.line - 1); }
+		}),
+		vscode.commands.registerCommand('json-lines-viewer.go-to-line', async () => {
+			const preview = currentPreview();
+			if (!preview) { return; }
+			const value = await vscode.window.showInputBox({
+				prompt: 'Enter a physical line number to preview',
+				value: String(Math.max(1, preview.line)),
+				validateInput: input => parseLineNumber(input) === undefined ? 'Enter a positive whole line number.' : undefined
+			});
+			if (value !== undefined) {
+				const line = parseLineNumber(value);
+				if (line !== undefined && currentPreview() === preview) { navigate(line); }
+			}
+		}),
+		vscode.commands.registerCommand('json-lines-viewer.refresh', () => {
+			const preview = currentPreview();
+			if (preview) {
+				reader.clear(preview.source.fsPath);
+				preview.totalLines = undefined;
+				navigate(preview.line);
+			}
+		}),
+		vscode.window.onDidChangeActiveTextEditor(updateStatus),
+		vscode.workspace.onDidChangeTextDocument(event => {
+			for (const preview of previews.values()) {
+				if (preview.source.toString() === event.document.uri.toString()) {
+					preview.totalLines = undefined;
+					preview.revision++;
+					changes.fire(preview.uri);
+				}
+			}
+		}),
+		vscode.workspace.onDidSaveTextDocument(document => {
+			reader.clear(document.uri.fsPath);
+			for (const preview of previews.values()) {
+				if (preview.source.toString() === document.uri.toString()) {
+					preview.totalLines = undefined;
+					preview.revision++;
+					changes.fire(preview.uri);
+				}
+			}
+		}),
+		vscode.workspace.onDidCloseTextDocument(document => {
+			const preview = previews.get(document.uri.toString());
+			if (preview) {
+				// Changing the preview language closes and immediately reopens the same URI.
+				setTimeout(() => {
+					if (!vscode.workspace.textDocuments.some(item => item.uri.toString() === document.uri.toString()) &&
+						previews.get(document.uri.toString()) === preview) {
+						reader.clear(preview.source.fsPath);
+						previews.delete(document.uri.toString());
+					}
+				}, 100);
+			}
+		})
+	);
+	updateStatus();
 }
-
-
-// this method is called when your extension is deactivated
-export function deactivate() {}
